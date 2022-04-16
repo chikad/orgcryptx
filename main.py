@@ -153,6 +153,8 @@ class TransactionOrganizer:
             get_txns_url = f"https://api.etherscan.io/api?module=account&action=txlist&address={self.address}&sort=asc&apikey={api_keys['ETHERSCAN']}"
         res = requests.get(get_txns_url).json()["result"]
         txns = [t["hash"] for t in txns]
+
+        # TODO : not handling incoming ERC20 token transfers
         return txns
 
     def get_transactions(self):
@@ -202,8 +204,15 @@ class TransactionOrganizer:
                 print(f"[  IN] {from_address} (transferred from)")
 
             else:
-                # TODO : covalent shows these extra transactions, that etherscan does not
-                print(f"[????] {from_address} -> {to_address}")
+                # someone else interacts with a contract
+                #   during contract execution, tokens are transferred to me
+                # for example,
+                #   > Coinbase calls Transfer on an ERC20 token contract
+                #   > the ERC20 token(s) appear at my address
+
+                # etherscan / snowtrace doesn't show these interactions when listing transactions,
+                #   but they can be obtained by querying ERC20 token transfers
+                print(f"[  IN] {from_address}")
 
 
         print()
