@@ -141,12 +141,36 @@ class TransactionOrganizer:
         self.contract_cache[contract_address] = contract
         return contract
 
-    def get_transactions(self):
+    def get_transactions_old(self):
+        """
+        returns list of transaction hashes, pulling from snowtrace / etherscan
+
+        ** UNUSED **
+        """
         if self.network == "AVAX":
             get_txns_url = f"https://api.snowtrace.io/api?module=account&action=txlist&address={self.address}&sort=asc&apikey={api_keys['SNOWTRACE']}"
         else:
             get_txns_url = f"https://api.etherscan.io/api?module=account&action=txlist&address={self.address}&sort=asc&apikey={api_keys['ETHERSCAN']}"
-        txns = requests.get(get_txns_url).json()["result"]
+        res = requests.get(get_txns_url).json()["result"]
+        txns = [t["hash"] for t in txns]
+        return txns
+
+    def get_transactions(self):
+        """
+        returns list of transaction hashes, pulling from covalent
+        """
+        if self.network == "AVAX":
+            chain_id = 43114
+        else:
+            chain_id = 1
+
+        get_txns_url = f"https://api.covalenthq.com/v1/{chain_id}/address/{self.address}/transactions_v2/?&key={api_keys['COVALENT']}"
+        res = requests.get(get_txns_url).json()["data"]
+
+        # TODO : currently not handling large number of transactions
+        assert not res["pagination"]["has_more"]
+
+        txns = [t["tx_hash"] for t in res["items"]]
         return txns
 
     def extract(self, network):
@@ -156,16 +180,15 @@ class TransactionOrganizer:
         print(f"FOUND {len(txns)} TRANSACTIONS FOR ADDRESS {self.address}")
         print(f"DISPLAYING FROM EARLIEST TO LATEST\n")
 
-        for txn in txns:
-            txn_hash = txn["hash"]
-
-            txn_details = self.web3.eth.get_transaction(txn["hash"])
+        for txn_hash in txns:
+            txn_details = self.web3.eth.get_transaction(txn_hash)
             from_address = txn_details["from"]
             to_address = txn_details["to"]
             fn_selector = txn_details["input"][:10]
 
             if from_address == self.address == to_address:
                 print("[SELF]")
+
             elif from_address == self.address:
                 contract = self.get_contract(to_address)
                 if contract.abi is not None:
@@ -177,6 +200,11 @@ class TransactionOrganizer:
             elif to_address == self.address:
                 # inflow
                 print(f"[  IN] {from_address} (transferred from)")
+
+            else:
+                # TODO : covalent shows these extra transactions, that etherscan does not
+                print(f"[????] {from_address} -> {to_address}")
+
 
         print()
 
