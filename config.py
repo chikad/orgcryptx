@@ -1,7 +1,8 @@
 api_keys = {
-    "SNOWTRACE" : "",
-    "ETHERSCAN" : "",
-    "ALCHEMY"   : "",
+	"SNOWTRACE" : "",
+	"ETHERSCAN" : "",
+	"ALCHEMY"   : "",
+    "COVALENT"  : ""
 }
 
 addresses = [

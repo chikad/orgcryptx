@@ -16,7 +16,7 @@ class Transaction:
     def __init__(self):
         pass
 
-class TransactionExtractor:
+class TransactionOrganizer:
     contract_cache = {}
     avax_web3 = Web3(Web3.HTTPProvider(AVAX_RPC))
     ethe_web3 = Web3(Web3.HTTPProvider(ETHE_RPC))
@@ -25,8 +25,8 @@ class TransactionExtractor:
         """
         address (str) : get transactions for this address
         """
-        if not TransactionExtractor.contract_cache:
-            TransactionExtractor.init_contract_cache()
+        if not TransactionOrganizer.contract_cache:
+            TransactionOrganizer.init_contract_cache()
 
         self.address = address
         self.network = None
@@ -55,9 +55,9 @@ class TransactionExtractor:
 
     def set_network(self, network):
         if network == "AVAX":
-            self.web3 = TransactionExtractor.avax_web3
+            self.web3 = TransactionOrganizer.avax_web3
         elif network == "ETHE":
-            self.web3 = TransactionExtractor.ethe_web3
+            self.web3 = TransactionOrganizer.ethe_web3
         else:
             assert False, f"unsupported network: {network}"
 
@@ -141,14 +141,17 @@ class TransactionExtractor:
         self.contract_cache[contract_address] = contract
         return contract
 
-    def extract(self, network):
-        self.set_network(network)
-
+    def get_transactions(self):
         if self.network == "AVAX":
             get_txns_url = f"https://api.snowtrace.io/api?module=account&action=txlist&address={self.address}&sort=asc&apikey={api_keys['SNOWTRACE']}"
         else:
             get_txns_url = f"https://api.etherscan.io/api?module=account&action=txlist&address={self.address}&sort=asc&apikey={api_keys['ETHERSCAN']}"
         txns = requests.get(get_txns_url).json()["result"]
+        return txns
+
+    def extract(self, network):
+        self.set_network(network)
+        txns = self.get_transactions()
 
         print(f"FOUND {len(txns)} TRANSACTIONS FOR ADDRESS {self.address}")
         print(f"DISPLAYING FROM EARLIEST TO LATEST\n")
@@ -179,6 +182,6 @@ class TransactionExtractor:
 
 if __name__ == "__main__":
     for addr in addresses:
-        te = TransactionExtractor(addr)
-        te.extract("AVAX")
-        te.extract("ETHE")
+        t = TransactionOrganizer(addr)
+        t.extract("AVAX")
+        t.extract("ETHE")
