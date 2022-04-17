@@ -3,6 +3,7 @@ import json
 import logging
 from decimal import Decimal
 from datetime import datetime, timezone
+from collections import defaultdict
 
 from web3 import Web3
 
@@ -14,9 +15,7 @@ class Wallet:
         self.address = address
         self.network = network
         self.transfers = [] # list of TokenTransfer
-        self.balances = {
-            network : 0,
-        } # token symbol -> balance
+        self.balances = defaultdict(int) # token symbol -> balance
 
     def add_transfers(self, transfers):
         self.transfers.extend(transfers)
@@ -24,8 +23,28 @@ class Wallet:
     def add_transfer(self, transfer):
         self.transfers.append(transfer)
 
-    def process(self):
-        sequence = sorted(self.transfers, key=lambda t : t.timestamp)
+    def replay_transfers(self):
+        """
+        - updates self.balances to the ending balances of all tokens in the
+          wallet after all transfers are executed.
+        - replay the list of associated transfers onto the wallet, with
+          all token balances starting at 0
+        - assert that the token balances are always non-negative after each tx
+
+        - logging
+            - for each transaction, log the incoming and outgoing transfers,
+              as well as fees paid
+            - log the ending balances of the tokens in the wallet
+
+        - note: starts with empty self.balances, and assumes self.transfers is
+                the full list of incoming and outgoing transfers of the wallet.
+                does not need to be sorted.
+
+        """
+        self.balances = defaultdict(int)
+
+        # within each transaction, list internal transactions last (internal tx fees == 0)
+        sequence = sorted(self.transfers, key=lambda t : (t.timestamp, -t.fees))
 
         seen_tx_hashes = set()
 
@@ -33,6 +52,7 @@ class Wallet:
             if tx.tx_hash not in seen_tx_hashes:
                 # multiple transfers may be in a transaction,
                 # deduct gas only once for the transaction
+                logging.info("~" * 80)
                 logging.info(f"tx hash: {tx.tx_hash}") # start of a new group of transfers
                 logging.info(f"tx time: {tx.timestamp}")
                 if tx.from_addr.lower() == self.address.lower():
@@ -40,8 +60,9 @@ class Wallet:
                     logging.info(f"fees paid: {tx.fees} {network}")
                 seen_tx_hashes.add(tx.tx_hash)
 
-            if tx.token_symbol not in self.balances:
-                self.balances[tx.token_symbol] = 0
+                # we are at a new tx, so validate ending balances
+                for token, bal in self.balances.items():
+                    assert bal >= 0, f"negative balance found for {token} token: {bal}..."
 
             if not tx.value:
                 continue
@@ -53,11 +74,12 @@ class Wallet:
                 self.balances[tx.token_symbol] += tx.value
                 logging.info(f"+ {tx.value} {tx.token_symbol}")
 
-            logging.info(f"cumulative balance ({tx.token_symbol}): {self.balances[tx.token_symbol]}")
+            logging.debug(f"cumulative balance ({tx.token_symbol}): {self.balances[tx.token_symbol]}")
 
         logging.info("=== token balances ===")
-        for token in self.balances:
+        for token, bal in self.balances.items():
             logging.info(f"{token}: {self.balances[token]}")
+            assert bal >= 0, f"negative balance found for {token} token: {bal}..."
         logging.info("======================")
 
 class TokenTransfer:
@@ -119,9 +141,14 @@ class TransactionOrganizer:
 
     def get_transactions_old(self):
         """
-        returns list of transaction hashes, pulling from snowtrace / etherscan
+        returns list of Transaction, pulling from snowtrace / etherscan
 
             sort order is earliest to latest transaction
+
+        only includes smart contract interactions initiated by our address,
+          does not include token transfers that happened during smart contract interactions
+          initiated by others. token transfers are also not directly returned, they need to
+          be extracted from the log events.
 
         ** UNUSED **
         """
@@ -130,14 +157,19 @@ class TransactionOrganizer:
         else:
             get_txns_url = f"https://api.etherscan.io/api?module=account&action=txlist&address={self.address}&sort=asc&apikey={api_keys['ETHERSCAN']}"
         res = requests.get(get_txns_url).json()["result"]
-        txns = [Transaction(t["hash"]) for t in txns]
 
-        # TODO : not handling incoming ERC20 token transfers
+        txns = []
+        for t in res:
+            txn = Transaction(t["hash"])
+            txn.gas_spent = t["gasUsed"]
+            txn.timestamp = datetime.fromtimestamp(int(t["timeStamp"]), tz=timezone.utc)
+            txns.append(txn)
+
         return txns
 
     def get_transactions(self):
         """
-        returns list of transaction hashes, pulling from covalent
+        returns list of Transaction, pulling from covalent
 
             sort order is earliest to latest transaction
         """
@@ -204,6 +236,34 @@ class TransactionOrganizer:
             ) for t in res
         ]
 
+    def get_internal_transactions(self):
+        """
+        returns list of TokenTransfer, pulling from snowtrace / etherscan
+
+            sort order is earliest to latest transaction
+        """
+        if self.network == "AVAX":
+            get_internal_txns_url = f"https://api.snowtrace.io/api?module=account&action=txlistinternal&address={self.address}&sort=asc&apikey={api_keys['SNOWTRACE']}"
+        else:
+            get_internal_txns_url = f"https://api.etherscan.io/api?module=account&action=txlistinternal&address={self.address}&sort=asc&apikey={api_keys['ETHERSCAN']}"
+        res = requests.get(get_internal_txns_url).json()["result"]
+
+        return [
+            TokenTransfer(
+                from_addr=t["from"],
+                to_addr=t["to"],
+                value=Web3.fromWei(int(t["value"]), 'ether'),
+                gas_used=0, # we pay no gas for the internal transactions
+                gas_price=0,
+                network=self.network,
+                token_symbol=self.network,
+                token_decimals=None,
+                token_type="native",
+                timestamp=datetime.fromtimestamp(int(t["timeStamp"]), tz=timezone.utc),
+                tx_hash=t["hash"] # internal txns have no tx hash, only a parent tx hash
+            ) for t in res
+        ]
+
     def extract(self, network):
         logging.info(f"EXTRACTING TRANSACTIONS ({network}) AT {self.address}")
         self._switch_network(network)
@@ -232,23 +292,30 @@ class TransactionOrganizer:
             done_hashes.add(t.tx_hash)
         wallet.add_transfers(erc721_transfers)
 
+        # [3-A] handle network native token transfers (in internal transactions)
+        internal_transactions = self.get_internal_transactions()
+        for t in internal_transactions:
+            if self.address.lower() == t.to_addr.lower():
+                logging.debug(f"[i IN] {t.value} {self.network} from {t.from_addr}")
+            else:
+                assert self.address.lower() == t.from_addr.lower()
+                logging.debug(f"[iOUT] {t.value} {self.network} to {t.to_addr}")
+        wallet.add_transfers(internal_transactions)
 
         txns = self.get_transactions()
-
         for txn in txns:
             txn_details = self.web3.eth.get_transaction(txn.hash)
             from_address = txn_details["from"]
             to_address = txn_details["to"]
             fn_selector = txn_details["input"][:10]
 
-            # [3] handle network native token transfers
+            # [3-B] handle network native token transfers
             native_token_transferred = Web3.fromWei(txn_details['value'], 'ether')
             if native_token_transferred:
                 val = native_token_transferred
 
                 if self.address == to_address:
                     logging.debug(f"[  IN] {val} {self.network} from {from_address}")
-
                 else:
                     assert self.address == from_address
                     logging.debug(f"[ OUT] {val} {self.network} to {to_address}")
@@ -342,5 +409,6 @@ if __name__ == "__main__":
         t = TransactionOrganizer(addr)
 
         for network in ["AVAX", "ETHE"]:
-            t.extract(network).process()
-            break
+            wallet = t.extract(network)
+            wallet.replay_transfers()
+
