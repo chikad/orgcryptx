@@ -1,21 +1,80 @@
 import requests
 import json
 import logging
+from decimal import Decimal
+from datetime import datetime, timezone
 
 from web3 import Web3
 
 from config import api_keys, addresses, WEB3_BY_NETWORK
 from ContractStorage import ContractStorage
 
+class Wallet:
+    def __init__(self, address, network):
+        self.address = address
+        self.network = network
+        self.transfers = [] # list of TokenTransfer
+        self.balances = {
+            network : 0,
+        } # token symbol -> balance
+
+    def add_transfers(self, transfers):
+        self.transfers.extend(transfers)
+
+    def add_transfer(self, transfer):
+        self.transfers.append(transfer)
+
+    def process(self):
+        sequence = sorted(self.transfers, key=lambda t : t.timestamp)
+
+        seen_tx_hashes = set()
+
+        for tx in sequence:
+            if tx.tx_hash not in seen_tx_hashes:
+                # multiple transfers may be in a transaction,
+                # deduct gas only once for the transaction
+                logging.info(f"tx hash: {tx.tx_hash}") # start of a new group of transfers
+                logging.info(f"tx time: {tx.timestamp}")
+                if tx.from_addr.lower() == self.address.lower():
+                    self.balances[tx.network] -= tx.fees
+                    logging.info(f"fees paid: {tx.fees} {network}")
+                seen_tx_hashes.add(tx.tx_hash)
+
+            if tx.token_symbol not in self.balances:
+                self.balances[tx.token_symbol] = 0
+
+            if not tx.value:
+                continue
+
+            if tx.from_addr.lower() == self.address.lower():
+                self.balances[tx.token_symbol] -= tx.value
+                logging.info(f"- {tx.value} {tx.token_symbol}")
+            elif tx.to_addr.lower() == self.address.lower():
+                self.balances[tx.token_symbol] += tx.value
+                logging.info(f"+ {tx.value} {tx.token_symbol}")
+
+            logging.info(f"cumulative balance ({tx.token_symbol}): {self.balances[tx.token_symbol]}")
+
+        logging.info("=== token balances ===")
+        for token in self.balances:
+            logging.info(f"{token}: {self.balances[token]}")
+        logging.info("======================")
+
 class TokenTransfer:
-    def __init__(self, from_addr, to_addr, value, gas_used,
-                 token_symbol, token_decimals,
+    def __init__(self, from_addr, to_addr, value,
+                 gas_used, gas_price, network,
+                 token_symbol, token_decimals, token_type,
                  timestamp, tx_hash):
         self.from_addr = from_addr
         self.to_addr = to_addr
-        self.value = float(value) / 10**int(token_decimals)
-        self.gas_used = gas_used
+        if token_decimals:
+            self.value = Decimal(value) / 10**int(token_decimals)
+        else:
+            self.value = Decimal(value)
+        self.fees = Web3.fromWei(int(gas_used) * int(gas_price), "ether")
+        self.network = network
         self.token_symbol = token_symbol
+        self.token_type = token_type
         self.timestamp = timestamp
         self.tx_hash = tx_hash
 
@@ -37,6 +96,7 @@ class Transaction:
 
         tx.fees_paid = tx_info["fees_paid"]
         tx.gas_spent = tx_info["gas_spent"]
+        tx.timestamp = datetime.strptime(tx_info["block_signed_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
         tx.log_events = tx_info["log_events"]
         tx.from_covalent = True
@@ -108,9 +168,12 @@ class TransactionOrganizer:
                 to_addr=t["to"],
                 value=t["value"],
                 gas_used=t["gasUsed"],
+                gas_price=t["gasPrice"],
+                network=self.network,
                 token_symbol=t["tokenSymbol"],
                 token_decimals=t["tokenDecimal"],
-                timestamp=t["timeStamp"],
+                token_type="ERC20",
+                timestamp=datetime.fromtimestamp(int(t["timeStamp"]), tz=timezone.utc),
                 tx_hash=t["hash"]
             ) for t in res
         ]
@@ -131,42 +194,48 @@ class TransactionOrganizer:
                 to_addr=t["to"],
                 value=1,
                 gas_used=t["gasUsed"],
+                gas_price=t["gasPrice"],
+                network=self.network,
                 token_symbol=t["tokenSymbol"],
                 token_decimals=t["tokenDecimal"],
-                timestamp=t["timeStamp"],
+                token_type="ERC721",
+                timestamp=datetime.fromtimestamp(int(t["timeStamp"]), tz=timezone.utc),
                 tx_hash=t["hash"]
             ) for t in res
         ]
 
     def extract(self, network):
-        logging.info(f"EXTRACTING TRANSACTIONS AT {self.address}")
+        logging.info(f"EXTRACTING TRANSACTIONS ({network}) AT {self.address}")
         self._switch_network(network)
+
+        wallet = Wallet(self.address, self.network)
 
         done_hashes = set()
 
         # [1] fetch the simple ERC-20 token transfers
-        for t in self.get_erc20_transfers():
+        erc20_transfers = self.get_erc20_transfers()
+        for t in erc20_transfers:
             if self.address.lower() == t.to_addr.lower():
                 logging.debug(f"[  IN] {t.value} {t.token_symbol}")
             elif self.address.lower() == t.from_addr.lower():
                 logging.debug(f"[ OUT] {t.value} {t.token_symbol}")
             done_hashes.add(t.tx_hash)
+        wallet.add_transfers(erc20_transfers)
 
         # [2] fetch the ERC-721 token transfers
+        erc721_transfers = self.get_erc721_transfers()
         for t in self.get_erc721_transfers():
             if self.address.lower() == t.to_addr.lower():
                 logging.debug(f"[  IN] NFT - {t.value} {t.token_symbol}")
             elif self.address.lower() == t.from_addr.lower():
                 logging.debug(f"[ OUT] NFT - {t.value} {t.token_symbol}")
             done_hashes.add(t.tx_hash)
+        wallet.add_transfers(erc721_transfers)
+
 
         txns = self.get_transactions()
 
         for txn in txns:
-            # already handled IN and OUT relevant to our address for these transactions
-            if txn.hash in done_hashes:
-                continue
-
             txn_details = self.web3.eth.get_transaction(txn.hash)
             from_address = txn_details["from"]
             to_address = txn_details["to"]
@@ -184,12 +253,44 @@ class TransactionOrganizer:
                     assert self.address == from_address
                     logging.debug(f"[ OUT] {val} {self.network} to {to_address}")
 
+                wallet.add_transfer(TokenTransfer(
+                    from_addr=from_address,
+                    to_addr=to_address,
+                    value=val,
+                    gas_used=txn.gas_spent,
+                    gas_price=txn_details["gasPrice"],
+                    network=self.network,
+                    token_symbol=self.network,
+                    token_decimals=None,
+                    token_type="native",
+                    timestamp=txn.timestamp,
+                    tx_hash=txn.hash
+                ))
+
                 continue
+
+            # already handled IN and OUT relevant to our address for these transactions
+            if txn.hash in done_hashes:
+                continue
+
+            # remaining transactions are only needed to account for gas usage
+            wallet.add_transfer(TokenTransfer(
+                from_addr=from_address,
+                to_addr=to_address,
+                value=0,
+                gas_used=txn.gas_spent,
+                gas_price=txn_details["gasPrice"],
+                network=self.network,
+                token_symbol=self.network,
+                token_decimals=None,
+                token_type=None,
+                timestamp=txn.timestamp,
+                tx_hash=txn.hash
+            ))
 
             # [4] handle SELF messages
             if from_address == self.address == to_address:
                 logging.debug("[SELF]")
-                # TODO
 
             # [5] handle contract interactions
             # the remaining must be contract interactions since this is not a native token Transfer
@@ -231,7 +332,7 @@ class TransactionOrganizer:
                 fn = ContractStorage.get_fn_name(contract, fn_selector)
                 logging.debug(f"[?</>]{from_address} {fn}")
 
-        print("=" * 80)
+        return wallet
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s :: %(levelname)s :: %(message)s')
@@ -239,5 +340,7 @@ if __name__ == "__main__":
         print("no addresses provided in config")
     for addr in addresses:
         t = TransactionOrganizer(addr)
-        t.extract("AVAX")
-        t.extract("ETHE")
+
+        for network in ["AVAX", "ETHE"]:
+            t.extract(network).process()
+            break
