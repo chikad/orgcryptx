@@ -3,7 +3,7 @@ import json
 import os
 
 from web3 import Web3
-from web3.exceptions import ContractLogicError
+from web3.exceptions import ContractLogicError, BadFunctionCallOutput
 
 from config import api_keys, WEB3_BY_NETWORK, ABI_CACHE_PATH
 
@@ -32,6 +32,12 @@ class ContractStorage:
             else:
                 cls.cache[contract_address] = cls.web3.eth.contract(contract_address)
 
+        with open("./ERC20-ABI.json") as f:
+            cls.ERC20_ABI = f.read()
+
+        with open("./ERC721-ABI.json") as f:
+            cls.ERC721_ABI = f.read()
+
         cls.initialized = True
 
     @classmethod
@@ -42,6 +48,36 @@ class ContractStorage:
             assert False, f"unsupported network: {network}"
 
         cls.network = network
+
+    @classmethod
+    def guess_abi(cls, contract_address):
+        """
+        attempt to guess ABI as ERC20 or ERC721
+
+        if neither seem to be correct, return contract with no ABI
+        """
+        contract = cls.web3.eth.contract(contract_address, abi=cls.ERC721_ABI)
+
+        try:
+            # test if the contract actually is ERC721 compatible
+            # ownerOf only in ERC721
+            contract.functions.ownerOf(0).call()
+            return contract
+        except BadFunctionCallOutput:
+            pass
+        except ContractLogicError:
+            # probably not authorized to call, but this means we were able to call it
+            return contract
+
+        contract = cls.web3.eth.contract(contract_address, abi=cls.ERC20_ABI)
+
+        try:
+            # test if the contract actually is ERC20 compatible
+            contract.functions.totalSupply().call()
+            return contract
+        except BadFunctionCallOutput:
+            # doesn't seem to be ERC20 compatible, don't use ABI
+            return cls.web3.eth.contract(contract.address)
 
     @classmethod
     def _get_contract(cls, contract_address):
@@ -55,8 +91,7 @@ class ContractStorage:
         if abi != "Contract source code not verified":
             contract = cls.web3.eth.contract(contract_address, abi=abi)
         else:
-            contract = cls.web3.eth.contract(contract_address)
-
+            contract = cls.guess_abi(contract_address)
         return contract
 
     @classmethod
@@ -135,6 +170,9 @@ class ContractStorage:
                  else, just returns the fn_selector
         """
         if contract.abi is not None:
-            return contract.get_function_by_selector(fn_selector).fn_name
+            try:
+                return contract.get_function_by_selector(fn_selector).fn_name
+            except:
+                return fn_selector
         else:
             return fn_selector
