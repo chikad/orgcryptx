@@ -9,13 +9,12 @@ from ContractStorage import ContractStorage
 
 class TokenTransfer:
     def __init__(self, from_addr, to_addr, value, gas_used,
-                 token_name, token_symbol, token_decimals,
+                 token_symbol, token_decimals,
                  timestamp, tx_hash):
         self.from_addr = from_addr
         self.to_addr = to_addr
         self.value = float(value) / 10**int(token_decimals)
         self.gas_used = gas_used
-        self.token_name = token_name
         self.token_symbol = token_symbol
         self.timestamp = timestamp
         self.tx_hash = tx_hash
@@ -42,58 +41,6 @@ class Transaction:
         tx.log_events = tx_info["log_events"]
         tx.from_covalent = True
         return tx
-
-    def decipher(self, our_address):
-        """
-        custom interpretation of events in a transaction
-            for each type of event we see, add interpretation logic here
-
-        ignore any events unrelated to our address
-
-        for example, an airdrop can initiate transfers to many addresses in one
-            transaction, and our address would only be one of the events in the transaction
-
-        another example, intermediate swaps in a swap transaction, we only care about what
-            leaves our wallet, and what enters our wallet
-        """
-        if not self.from_covalent:
-            return
-
-        # addresses from covalent are lowercase form, so for comparison purposes, lowercase our address
-        our_address = our_address.lower()
-
-        for event in self.log_events:
-            # custom handling of events in a transaction
-            if not event["decoded"]:
-                logging.info("unknown event")
-                continue
-
-            event_name = event["decoded"]["name"]
-            if event_name == "Transfer":
-                from_address, to_address, value = [p["value"] for p in event["decoded"]["params"]]
-
-                if value is None: # for ERC721
-                    value = 1
-
-                value = float(value) / 10**int(event['sender_contract_decimals'])
-                if from_address == our_address:
-                    logging.info(f"OUT {value} {event['sender_address_label']} to {to_address}")
-                elif to_address == our_address:
-                    logging.info(f"IN {value} {event['sender_address_label']} from {self.from_addr_label}")
-                else: # not related to our address
-                    continue
-            elif event_name == "Approval":
-                owner, spender, value = [p["value"] for p in event["decoded"]["params"]]
-
-                if owner != our_address:
-                    # don't have to worry about approvals not related to our address
-                    continue
-
-                # spender is not important
-                # TODO : only relevance to us is the gas cost
-                logging.info(f"approve token: {event['sender_address_label']}")
-            else:
-                logging.info(f"\t{event['decoded']['name']}")
 
 class TransactionOrganizer:
     def __init__(self, address):
@@ -161,7 +108,6 @@ class TransactionOrganizer:
                 to_addr=t["to"],
                 value=t["value"],
                 gas_used=t["gasUsed"],
-                token_name=t["tokenName"],
                 token_symbol=t["tokenSymbol"],
                 token_decimals=t["tokenDecimal"],
                 timestamp=t["timeStamp"],
@@ -185,7 +131,6 @@ class TransactionOrganizer:
                 to_addr=t["to"],
                 value=1,
                 gas_used=t["gasUsed"],
-                token_name=t["tokenName"],
                 token_symbol=t["tokenSymbol"],
                 token_decimals=t["tokenDecimal"],
                 timestamp=t["timeStamp"],
@@ -194,6 +139,7 @@ class TransactionOrganizer:
         ]
 
     def extract(self, network):
+        logging.info(f"EXTRACTING TRANSACTIONS AT {self.address}")
         self._switch_network(network)
 
         done_hashes = set()
@@ -201,24 +147,20 @@ class TransactionOrganizer:
         # [1] fetch the simple ERC-20 token transfers
         for t in self.get_erc20_transfers():
             if self.address.lower() == t.to_addr.lower():
-                logging.info(f"[  IN] {t.value} {t.token_symbol}")
+                logging.debug(f"[  IN] {t.value} {t.token_symbol}")
             elif self.address.lower() == t.from_addr.lower():
-                logging.info(f"[ OUT] {t.value} {t.token_symbol}")
+                logging.debug(f"[ OUT] {t.value} {t.token_symbol}")
             done_hashes.add(t.tx_hash)
 
         # [2] fetch the ERC-721 token transfers
         for t in self.get_erc721_transfers():
             if self.address.lower() == t.to_addr.lower():
-                logging.info(f"[  IN] NFT - {t.value} {t.token_symbol}")
+                logging.debug(f"[  IN] NFT - {t.value} {t.token_symbol}")
             elif self.address.lower() == t.from_addr.lower():
-                logging.info(f"[ OUT] NFT - {t.value} {t.token_symbol}")
+                logging.debug(f"[ OUT] NFT - {t.value} {t.token_symbol}")
             done_hashes.add(t.tx_hash)
 
-        print()
         txns = self.get_transactions()
-
-        logging.info(f"FOUND {len(txns)} {self.network} TRANSACTIONS FOR ADDRESS {self.address}")
-        logging.info(f"DISPLAYING FROM EARLIEST TO LATEST\n")
 
         for txn in txns:
             # already handled IN and OUT relevant to our address for these transactions
@@ -236,17 +178,17 @@ class TransactionOrganizer:
                 val = native_token_transferred
 
                 if self.address == to_address:
-                    logging.info(f"[  IN] {val} {self.network} from {from_address}")
+                    logging.debug(f"[  IN] {val} {self.network} from {from_address}")
 
                 else:
                     assert self.address == from_address
-                    logging.info(f"[ OUT] {val} {self.network} to {to_address}")
+                    logging.debug(f"[ OUT] {val} {self.network} to {to_address}")
 
                 continue
 
             # [4] handle SELF messages
             if from_address == self.address == to_address:
-                logging.info("[SELF]")
+                logging.debug("[SELF]")
                 # TODO
 
             # [5] handle contract interactions
@@ -256,13 +198,13 @@ class TransactionOrganizer:
                 fn = ContractStorage.get_fn_name(contract, fn_selector)
                 if fn == "approve":
                     token_symbol = contract.functions.symbol().call()
-                    logging.info(f"[APPR] {fn} {token_symbol}")
+                    logging.debug(f"[APPR] {fn} {token_symbol}")
                 else:
                     # contract interaction with no associated IN or OUT transfers
                     #   for example, calling a function that allows (or stops) your loaned
                     #   tokens to be used as collateral that you to borrow against
                     # we are the ones interacting with the contract
-                    logging.info(f"[*</>] {to_address} {fn}")
+                    logging.debug(f"[*</>] {to_address} {fn}")
 
             elif to_address == self.address:
                 # contract address cannot be in [from] address
@@ -280,18 +222,14 @@ class TransactionOrganizer:
 
             else:
                 # someone else interacted with a contract, we receive an incoming transfer
-                logging.warning(f"ERC20, ERC721, and native token incoming transfers should already have been handled, tx_hash: {txn.hash}")
+                logging.debug(f"ERC20, ERC721, and native token incoming transfers should already have been handled, tx_hash: {txn.hash}")
 
                 # contract interaction with no associated IN or OUT transfers
                 # someone else interacted with the contract, and we were "affected"
                 # not sure what "affected" is yet...
                 contract = ContractStorage.get_contract(to_address, self.network)
                 fn = ContractStorage.get_fn_name(contract, fn_selector)
-                logging.info(f"[?</>]{from_address} {fn}")
-
-            # # log some more details about the transaction
-            # # currently does nothing if txn data was not obtained from covalent
-            # txn.decipher(self.address)
+                logging.debug(f"[?</>]{from_address} {fn}")
 
         print("=" * 80)
 
